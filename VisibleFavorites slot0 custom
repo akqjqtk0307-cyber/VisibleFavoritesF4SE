@@ -1,0 +1,77 @@
+name: Build VisibleFavorites (Slot 0 patch)
+
+# Manual build only: Actions tab -> this workflow -> "Run workflow".
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-2025-vs2026
+    steps:
+      - name: Checkout plugin source (this fork)
+        uses: actions/checkout@v4
+        with:
+          path: plugin
+
+      - name: Checkout CommonLibF4 (Flip-777 fork, branch rel3gen)
+        uses: actions/checkout@v4
+        with:
+          repository: Flip-777/CommonLibF4
+          ref: rel3gen
+          path: commonlib
+
+      # Slot 0's display is hidden whenever its weapon is equipped (drawn OR
+      # sheathed). All other slots keep the original behaviour.
+      - name: Apply Slot 0 patch
+        shell: pwsh
+        run: |
+          $f = Join-Path $env:GITHUB_WORKSPACE "plugin/src/DisplayManager.cpp"
+          $old = 'if (g_state[slot].equippedDisplay && g_playerWeaponDrawn) {'
+          $new = 'if (g_state[slot].equippedDisplay && (g_playerWeaponDrawn || slot == 0)) {'
+          $enc = New-Object System.Text.UTF8Encoding($false)
+          $text = [System.IO.File]::ReadAllText($f, $enc)
+          if (-not $text.Contains($old)) { throw "Patch target not found in DisplayManager.cpp" }
+          $text = $text.Replace($old, $new)
+          [System.IO.File]::WriteAllText($f, $text, $enc)
+          Select-String -Path $f -Pattern 'slot == 0' | ForEach-Object { $_.Line }
+
+      # The repo pins the author's local Visual Studio path in its vcpkg triplet,
+      # and treats warnings as errors. Neither exists/applies on the runner.
+      - name: Relax toolset pins and warnings-as-errors
+        shell: pwsh
+        run: |
+          $trip = Join-Path $env:GITHUB_WORKSPACE "plugin/cmake/triplets/x64-windows-static-md.cmake"
+          $lines = Get-Content $trip | Where-Object { $_ -notmatch 'VCPKG_VISUAL_STUDIO_PATH|VCPKG_PLATFORM_TOOLSET' }
+          $lines += 'set(VCPKG_BUILD_TYPE release)'
+          Set-Content -Path $trip -Value $lines
+          $cm = Join-Path $env:GITHUB_WORKSPACE "plugin/CMakeLists.txt"
+          $c = Get-Content $cm | ForEach-Object { $_ -replace '^\s*/WX\s*#.*$', '' }
+          Set-Content -Path $cm -Value $c
+
+      # The runner's vcpkg is a shallow clone and cannot resolve the
+      # builtin-baseline in vcpkg.json, so use a full clone instead.
+      - name: Set up full vcpkg
+        shell: pwsh
+        run: |
+          git clone --quiet https://github.com/microsoft/vcpkg C:\vcpkg_full
+          & C:\vcpkg_full\bootstrap-vcpkg.bat -disableMetrics
+          "VCPKG_INSTALLATION_ROOT=C:\vcpkg_full" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Configure
+        shell: pwsh
+        run: |
+          cmake -S plugin -B build -A x64 "-DCommonLibF4Path=$env:GITHUB_WORKSPACE/commonlib/CommonLibF4"
+
+      - name: Build
+        shell: pwsh
+        run: |
+          cmake --build build --config Release --parallel
+
+      - name: Upload DLL
+        uses: actions/upload-artifact@v4
+        with:
+          name: VisibleFavorites-slot0-patch
+          path: |
+            build/Release/VisibleFavorites.dll
+            build/Release/VisibleFavorites.pdb
+          if-no-files-found: error
